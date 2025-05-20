@@ -1,0 +1,15 @@
+Setup
+git init
+git remote add origin https://github.com/ab-shrek/py_fight.git
+git branch -M main
+git remote set-url origin git@github.com:ab-shrek/py_fight.git
+git push -u origin main
+
+Instead i should have done this
+
+git init
+git remote add origin git@github.com/ab-shrek/py_fight.git
+git branch -M main
+git push -u origin main
+
+

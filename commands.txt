@@ -1,0 +1,6 @@
+lsof -i :5001
+kill -9 $(lsof -ti :5001); ps aux | grep game.py | grep server | awk '{print $2}' | xargs kill -9;rm *.log; rm *.jsonl
+
+source venv/bin/activate
+rm *.log
+python run_parallel_games.py --instances 1 --cycles 1 > mario.log
