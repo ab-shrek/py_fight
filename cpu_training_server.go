@@ -31,6 +31,7 @@ const (
 	LogFile        = "parallel_games.log"
 )
 
+// Experience represents a single training experience
 type Experience struct {
 	Observation []float32 `json:"observation"`
 	Action      struct {
@@ -46,6 +47,7 @@ type Experience struct {
 	Done        bool      `json:"done"`
 }
 
+// ExperienceBuffer stores experiences for training
 type ExperienceBuffer struct {
 	data    []Experience
 	maxSize int
@@ -59,32 +61,6 @@ func NewExperienceBuffer(maxSize int) *ExperienceBuffer {
 	}
 }
 
-// func (b *ExperienceBuffer) Add(exp Experience) {
-// 	b.mu.Lock()
-// 	defer b.mu.Unlock()
-// 	if len(b.data) >= b.maxSize {
-// 		b.data = b.data[1:]
-// 	}
-// 	b.data = append(b.data, exp)
-// 	log.Printf("[CPU Server] Added experience to buffer - Current size: %d/%d", len(b.data), b.maxSize)
-// }
-
-// func (b *ExperienceBuffer) GetBatch(size int) []Experience {
-// 	b.mu.RLock()
-// 	if len(b.data) < size {
-// 		b.mu.RUnlock()
-// 		return nil
-// 	}
-// 	// Create a copy of the data we need while holding the lock
-// 	indices := rand.Perm(len(b.data))[:size]
-// 	dataCopy := make([]Experience, size)
-// 	for i, idx := range indices {
-// 		dataCopy[i] = b.data[idx]
-// 	}
-// 	b.mu.RUnlock()
-// 	return dataCopy
-// }
-
 func (b *ExperienceBuffer) Size() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -92,61 +68,71 @@ func (b *ExperienceBuffer) Size() int {
 }
 
 type Model struct {
-	mu           sync.RWMutex
-	actorWeights  []float32
-	criticWeights []float32
-	learningRate  float32
-	gamma         float32
-	lambda        float32
-	totalSteps    int64
+	*BaseModel  // Embed the base model for common functionality
 }
 
 func NewModel() *Model {
-	m := &Model{
-		learningRate: 0.0001,
-		gamma:       0.99,
-		lambda:      0.95,
+	// Create the model with the base model
+	return &Model{
+		BaseModel: NewBaseModel(),
 	}
-	// Input size is now 308 (8 basic + 300 grid values)
-	m.actorWeights = make([]float32, 308*64+64*64+64*4)
-	m.criticWeights = make([]float32, 64*1)
-	for i := range m.actorWeights {
-		m.actorWeights[i] = float32(rand.NormFloat64()) * float32(math.Sqrt(2.0/308))
-	}
-	for i := range m.criticWeights {
-		m.criticWeights[i] = float32(rand.NormFloat64()) * float32(math.Sqrt(2.0/64))
-	}
-	return m
 }
 
 func (m *Model) Forward(obs []float32) ([]float32, float32) {
 	if len(obs) != 308 {
+		log.Printf("[ERROR] Invalid observation size: %d, expected 308", len(obs))
 		return []float32{0, 0, 0, 0}, 0
 	}
+
+	if len(m.actorWeights) == 0 || len(m.criticWeights) == 0 {
+		log.Printf("[ERROR] Model weights not initialized")
+		return []float32{0, 0, 0, 0}, 0
+	}
+
+	// Log input observations for debugging
+	// mario commenting log
+	// log.Printf("[DEBUG] Forward pass input - Observation: %v", obs)
+
 	// Hidden layer 1 (308->64)
 	hidden1 := make([]float32, 64)
 	for i := 0; i < 64; i++ {
 		var sum float32
+		// Access weights in column-major order to match GPU version
 		for j := 0; j < 308; j++ {
-			sum += obs[j] * m.actorWeights[j*64+i]
+			sum += obs[j] * m.actorWeights[j*64+i]  // j*64+i for column-major
 		}
+		// ReLU activation
 		hidden1[i] = float32(math.Max(0, float64(sum)))
 	}
+
+	// Log hidden1 activations
+	// mario commenting log
+	// log.Printf("[DEBUG] Hidden1 activations - Mean: %f, Max: %f", 
+	// 	mean(hidden1), max(hidden1))
+
 	// Hidden layer 2 (64->64)
 	hidden2 := make([]float32, 64)
 	for i := 0; i < 64; i++ {
 		var sum float32
+		// Access weights in column-major order
 		for j := 0; j < 64; j++ {
-			sum += hidden1[j] * m.actorWeights[308*64+j*64+i]
+			sum += hidden1[j] * m.actorWeights[308*64+j*64+i]  // 308*64 offset for second layer
 		}
+		// ReLU activation
 		hidden2[i] = float32(math.Max(0, float64(sum)))
 	}
+
+	// Log hidden2 activations
+	// mario commenting log
+	// log.Printf("[DEBUG] Hidden2 activations - Mean: %f, Max: %f", 
+	// 	mean(hidden2), max(hidden2))
+	
 	// Output layer (64->4)
 	actions := make([]float32, 4)
 	for i := 0; i < 4; i++ {
 		var sum float32
 		for j := 0; j < 64; j++ {
-			sum += hidden2[j] * m.actorWeights[308*64+64*64+j*4+i]
+			sum += hidden2[j] * m.actorWeights[308*64+64*64+j*4+i]  // 308*64+64*64 offset for output layer
 		}
 		if i < 3 {  // First 3 actions (move_x, move_z, rotate) use tanh
 			actions[i] = float32(math.Tanh(float64(sum)))
@@ -154,11 +140,17 @@ func (m *Model) Forward(obs []float32) ([]float32, float32) {
 			actions[i] = float32(1.0 / (1.0 + math.Exp(-float64(sum))))
 		}
 	}
+
 	// Value prediction (64->1)
 	var value float32
 	for i := 0; i < 64; i++ {
 		value += hidden2[i] * m.criticWeights[i]
 	}
+
+	// Log output for debugging
+	// mario commenting log
+	// log.Printf("[DEBUG] Forward pass output - Actions: %v, Value: %f", actions, value)
+
 	return actions, value
 }
 

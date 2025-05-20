@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -28,6 +29,7 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+	"bytes"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shirou/gopsutil/v3/process"
@@ -55,7 +57,6 @@ const (
 	BufferSize     = 1000000
 	MinBufferSize  = 10000
 	MaxConnections = 1000
-	CheckpointDir  = "checkpoints"
 	LogDir         = "logs"
 	UseGPU         = true  // Enable GPU by default
 	Port           = 5000
@@ -540,13 +541,18 @@ func initGPU() (*GPUConfig, error) {
 
 // Experience represents a single training experience
 type Experience struct {
-	Observation []float32 `json:"observation"`
-	Action      []float32 `json:"action"`
-	Reward      float32   `json:"reward"`
-	Value       float32   `json:"value"`
-	NextValue   float32   `json:"next_value"`
-	LogProb     float32   `json:"log_prob"`
-	Done        bool      `json:"done"`
+    Observation []float32 `json:"observation"`
+    Action      struct {
+        MoveX   float32 `json:"move_x"`
+        MoveZ   float32 `json:"move_z"`
+        Rotate  float32 `json:"rotate"`
+        Shoot   bool    `json:"shoot"`
+    } `json:"action"`
+    Reward      float32   `json:"reward"`
+    Value       float32   `json:"value"`
+    NextValue   float32   `json:"next_value"`
+    LogProbs    []float32 `json:"log_probs"` // Store log probabilities for all actions
+    Done        bool      `json:"done"`
 }
 
 // TrainingMetadata tracks training statistics
@@ -811,10 +817,8 @@ func (s *LearningRateScheduler) GetLR() float32 {
 
 // Model represents the neural network model
 type Model struct {
-	mu sync.RWMutex
-	// Model parameters
-	actorWeights  []float32
-	criticWeights []float32
+	*BaseModel  // Embed the base model for common functionality
+	
 	// GPU buffers
 	gpuBuffers struct {
 		actorWeights  C.CUdeviceptr
@@ -830,8 +834,8 @@ type Model struct {
 	cudaContext C.CUcontext
 	// CUDA streams
 	cudaStreams struct {
-		 compute C.CUstream
-		 memory  C.CUstream
+		compute C.CUstream
+		memory  C.CUstream
 	}
 	// CUDA kernels
 	kernels struct {
@@ -841,11 +845,6 @@ type Model struct {
 		forwardValue   C.CUfunction
 		train          C.CUfunction
 	}
-	// Hyperparameters
-	learningRate float32
-	gamma        float32
-	lambda       float32
-	epsilon      float32
 	// Optimizer state
 	actorMomentum  []float32
 	criticMomentum []float32
@@ -853,42 +852,22 @@ type Model struct {
 	criticRMS      []float32
 	scheduler      *LearningRateScheduler
 	device         string // "cpu" or "cuda"
-	// Training metadata
-	totalSteps    int64
-	metadataMutex sync.RWMutex
 	// Context management
 	contextLock sync.Mutex
 	isContextCurrent bool
+	// Training metadata
+	metadataMutex sync.RWMutex
 }
 
 // NewModel creates a new model instance
 func NewModel(gpuConfig *GPUConfig) *Model {
-    m := &Model{
-        device: "cuda",
-        learningRate: 0.0001,  // Keep learning rate low for stability
-        gamma: 0.99,
-        lambda: 0.95,
-        epsilon: 0.8,  // Increased from 0.4 to 0.8 for maximum exploration
-    }
+    // Initialize base model using the constructor
+    baseModel := NewBaseModel()
 
-    // Initialize weights with Xavier/Glorot initialization
-    // input->hidden1 (6->64)
-    m.actorWeights = make([]float32, 6*64 + 64*64 + 64*3)  // input->hidden1 + hidden1->hidden2 + hidden2->output
-    m.criticWeights = make([]float32, 64*1)  // hidden2->value (64->1)
-    
-    // Xavier/Glorot initialization with gain=1.0 for better stability
-    for i := range m.actorWeights {
-        if i < 6*64 {  // input->hidden1
-            m.actorWeights[i] = float32(rand.NormFloat64()) * float32(math.Sqrt(2.0/float64(6)))  // gain=1.0
-        } else if i < 6*64 + 64*64 {  // hidden1->hidden2
-            m.actorWeights[i] = float32(rand.NormFloat64()) * float32(math.Sqrt(2.0/float64(64)))
-        } else {  // hidden2->output
-            m.actorWeights[i] = float32(rand.NormFloat64()) * float32(math.Sqrt(2.0/float64(64)))
-        }
-    }
-    
-    for i := range m.criticWeights {
-        m.criticWeights[i] = float32(rand.NormFloat64()) * float32(math.Sqrt(2.0/float64(64)))
+    // Create the GPU model with the base model
+    m := &Model{
+        BaseModel: baseModel,
+        device: "cuda",
     }
 
     // Initialize optimizer state
@@ -949,7 +928,7 @@ func (m *Model) initializeCUDA(gpuConfig *GPUConfig) error {
     }
 
     // Allocate GPU memory for intermediate buffers
-    if err := result(C.cuMemAlloc(&m.gpuBuffers.input, C.size_t(6*4))); err != nil { // 6 input features
+    if err := result(C.cuMemAlloc(&m.gpuBuffers.input, C.size_t(InputSize*4))); err != nil {
         return fmt.Errorf("failed to allocate GPU memory for input buffer: %v", err)
     }
     if err := result(C.cuMemAlloc(&m.gpuBuffers.hidden, C.size_t(64*4))); err != nil { // 64 hidden units
@@ -958,7 +937,7 @@ func (m *Model) initializeCUDA(gpuConfig *GPUConfig) error {
     if err := result(C.cuMemAlloc(&m.gpuBuffers.hidden2, C.size_t(64*4))); err != nil { // 64 hidden units
         return fmt.Errorf("failed to allocate GPU memory for hidden2 buffer: %v", err)
     }
-    if err := result(C.cuMemAlloc(&m.gpuBuffers.output, C.size_t(3*4))); err != nil { // 3 output actions
+    if err := result(C.cuMemAlloc(&m.gpuBuffers.output, C.size_t(OutputSize*4))); err != nil { // 3 output actions
         return fmt.Errorf("failed to allocate GPU memory for output buffer: %v", err)
     }
     if err := result(C.cuMemAlloc(&m.gpuBuffers.value, C.size_t(4))); err != nil { // 1 value output
@@ -1070,17 +1049,17 @@ func kernelArgs(args []unsafe.Pointer) unsafe.Pointer {
 
 // Forward performs a forward pass through the network
 func (m *Model) Forward(obs []float32) ([]float32, float32) {
-    if len(obs) != 6 {
-        log.Printf("[ERROR] Invalid observation size: %d, expected 6", len(obs))
-        return []float32{0, 0, 0}, 0
+    if len(obs) != InputSize {
+        log.Printf("[ERROR] Invalid observation size: %d, expected %d", len(obs), InputSize)
+        return make([]float32, OutputSize), 0
     }
 
     // Log input observations
     log.Printf("[DEBUG] Forward pass input - Observation: %v", obs)
 
     if m.device == "cuda" {
-        // Copy input to GPU (observations are already normalized from Unity)
-        if err := result(C.cuMemcpyHtoDAsync(m.gpuBuffers.input, unsafe.Pointer(&obs[0]), C.size_t(len(obs)*4), m.cudaStreams.memory)); err != nil {
+        // Copy input to GPU
+        if err := result(C.cuMemcpyHtoDAsync(m.gpuBuffers.input, unsafe.Pointer(&obs[0]), C.size_t(InputSize*4), m.cudaStreams.compute)); err != nil {
             log.Printf("[ERROR] Failed to copy input to GPU: %v", err)
             return m.forwardCPU(obs)
         }
@@ -1091,14 +1070,14 @@ func (m *Model) Forward(obs []float32) ([]float32, float32) {
         args[0] = unsafe.Pointer(&m.gpuBuffers.input)
         args[1] = unsafe.Pointer(&m.gpuBuffers.actorWeights)
         args[2] = unsafe.Pointer(&m.gpuBuffers.hidden)
-        inputSize := C.int(6)
-        hiddenSize := C.int(64)
+        inputSize := C.int(InputSize)
+        hiddenSize := C.int(HiddenSize)
         args[3] = unsafe.Pointer(&inputSize)
         args[4] = unsafe.Pointer(&hiddenSize)
         cArgs := kernelArgs(args)
         if err := result(C.cuLaunchKernel(
             m.kernels.forwardHidden,
-            C.uint((64+255)/256), 1, 1,
+            C.uint((HiddenSize+255)/256), 1, 1,
             256, 1, 1,
             0, m.cudaStreams.compute,
             (*unsafe.Pointer)(cArgs), nil,
@@ -1116,7 +1095,7 @@ func (m *Model) Forward(obs []float32) ([]float32, float32) {
         cArgs = kernelArgs(args)
         if err := result(C.cuLaunchKernel(
             m.kernels.forwardHidden2,
-            C.uint((64+255)/256), 1, 1,
+            C.uint((HiddenSize+255)/256), 1, 1,
             256, 1, 1,
             0, m.cudaStreams.compute,
             (*unsafe.Pointer)(cArgs), nil,
@@ -1130,13 +1109,13 @@ func (m *Model) Forward(obs []float32) ([]float32, float32) {
         args[0] = unsafe.Pointer(&m.gpuBuffers.hidden2)
         args[1] = unsafe.Pointer(&m.gpuBuffers.actorWeights)
         args[2] = unsafe.Pointer(&m.gpuBuffers.output)
-        outputSize := C.int(3)
+        outputSize := C.int(OutputSize)
         args[3] = unsafe.Pointer(&hiddenSize)
         args[4] = unsafe.Pointer(&outputSize)
         cArgs = kernelArgs(args)
         if err := result(C.cuLaunchKernel(
             m.kernels.forwardOutput,
-            C.uint((3+255)/256), 1, 1,
+            C.uint((OutputSize+255)/256), 1, 1,
             256, 1, 1,
             0, m.cudaStreams.compute,
             (*unsafe.Pointer)(cArgs), nil,
@@ -1169,9 +1148,9 @@ func (m *Model) Forward(obs []float32) ([]float32, float32) {
             return m.forwardCPU(obs)
         }
 
-        actions := make([]float32, 3)
+        actions := make([]float32, OutputSize)
         var valueResult float32
-        if err := result(C.cuMemcpyDtoH(unsafe.Pointer(&actions[0]), m.gpuBuffers.output, C.size_t(3*4))); err != nil {
+        if err := result(C.cuMemcpyDtoH(unsafe.Pointer(&actions[0]), m.gpuBuffers.output, C.size_t(OutputSize*4))); err != nil {
             return m.forwardCPU(obs)
         }
         if err := result(C.cuMemcpyDtoH(unsafe.Pointer(&valueResult), m.gpuBuffers.value, C.size_t(4))); err != nil {
@@ -1183,7 +1162,7 @@ func (m *Model) Forward(obs []float32) ([]float32, float32) {
         
         // Clamp actions to valid ranges
         for i := range actions {
-            if i < 2 {  // Movement actions
+            if i < 3 {  // Movement and rotation actions
                 actions[i] = float32(math.Max(-1, math.Min(1, float64(actions[i]))))
             } else {  // Shooting action
                 actions[i] = float32(math.Max(0, math.Min(1, float64(actions[i]))))
@@ -1198,26 +1177,26 @@ func (m *Model) Forward(obs []float32) ([]float32, float32) {
 
 // forwardCPU performs a forward pass on CPU
 func (m *Model) forwardCPU(obs []float32) ([]float32, float32) {
-    if len(obs) != 6 {
-        log.Printf("[ERROR] Invalid observation size: %d, expected 6", len(obs))
-        return []float32{0, 0, 0}, 0
+    if len(obs) != InputSize {
+        log.Printf("[ERROR] Invalid observation size: %d, expected %d", len(obs), InputSize)
+        return make([]float32, OutputSize), 0
     }
 
     if len(m.actorWeights) == 0 || len(m.criticWeights) == 0 {
         log.Printf("[ERROR] Model weights not initialized")
-        return []float32{0, 0, 0}, 0
+        return make([]float32, OutputSize), 0
     }
 
     // Log input observations for debugging
     log.Printf("[DEBUG] Forward pass input - Observation: %v", obs)
 
-    // Hidden layer 1 (6->64)
-    hidden1 := make([]float32, 64)
-    for i := 0; i < 64; i++ {
+    // Hidden layer 1 (InputSize->HiddenSize)
+    hidden1 := make([]float32, HiddenSize)
+    for i := 0; i < HiddenSize; i++ {
         var sum float32
         // Access weights in column-major order to match CUDA kernel
-        for j := 0; j < 6; j++ {
-            sum += obs[j] * m.actorWeights[j*64+i]  // j*64+i for column-major
+        for j := 0; j < InputSize; j++ {
+            sum += obs[j] * m.actorWeights[j*HiddenSize+i]  // j*HiddenSize+i for column-major
         }
         // ReLU activation
         hidden1[i] = float32(math.Max(0, float64(sum)))
@@ -1227,13 +1206,13 @@ func (m *Model) forwardCPU(obs []float32) ([]float32, float32) {
     log.Printf("[DEBUG] Hidden1 activations - Mean: %f, Max: %f", 
         mean(hidden1), max(hidden1))
 
-    // Hidden layer 2 (64->64)
-    hidden2 := make([]float32, 64)
-    for i := 0; i < 64; i++ {
+    // Hidden layer 2 (HiddenSize->HiddenSize)
+    hidden2 := make([]float32, HiddenSize)
+    for i := 0; i < HiddenSize; i++ {
         var sum float32
         // Access weights in column-major order
-        for j := 0; j < 64; j++ {
-            sum += hidden1[j] * m.actorWeights[6*64+j*64+i]  // 6*64 offset for second layer
+        for j := 0; j < HiddenSize; j++ {
+            sum += hidden1[j] * m.actorWeights[InputSize*HiddenSize+j*HiddenSize+i]
         }
         // ReLU activation
         hidden2[i] = float32(math.Max(0, float64(sum)))
@@ -1243,16 +1222,16 @@ func (m *Model) forwardCPU(obs []float32) ([]float32, float32) {
     log.Printf("[DEBUG] Hidden2 activations - Mean: %f, Max: %f", 
         mean(hidden2), max(hidden2))
     
-    // Output layer (64->3)
-    actions := make([]float32, 3)
-    for i := 0; i < 3; i++ {
+    // Output layer (HiddenSize->OutputSize)
+    actions := make([]float32, OutputSize)
+    for i := 0; i < OutputSize; i++ {
         var sum float32
         // Access weights in column-major order
-        for j := 0; j < 64; j++ {
-            sum += hidden2[j] * m.actorWeights[6*64+64*64+j*3+i]  // 6*64+64*64 offset for output layer
+        for j := 0; j < HiddenSize; j++ {
+            sum += hidden2[j] * m.actorWeights[InputSize*HiddenSize+HiddenSize*HiddenSize+j*OutputSize+i]
         }
         
-        if i < 2 {  // Movement actions (moveX, moveZ)
+        if i < 3 {  // Movement and rotation actions
             // Tanh activation for bounded movement [-1, 1]
             actions[i] = float32(math.Tanh(float64(sum)))
         } else {  // Shooting action
@@ -1266,7 +1245,7 @@ func (m *Model) forwardCPU(obs []float32) ([]float32, float32) {
     
     // Clamp actions to valid ranges
     for i := range actions {
-        if i < 2 {  // Movement actions
+        if i < 3 {  // Movement and rotation actions
             actions[i] = float32(math.Max(-1, math.Min(1, float64(actions[i]))))
         } else {  // Shooting action
             actions[i] = float32(math.Max(0, math.Min(1, float64(actions[i]))))
@@ -1286,25 +1265,6 @@ func (m *Model) forwardCPU(obs []float32) ([]float32, float32) {
     log.Printf("[DEBUG] Value prediction: %f", value)
     
     return actions, value
-}
-
-// Helper functions for logging
-func mean(values []float32) float32 {
-    var sum float32
-    for _, v := range values {
-        sum += v
-    }
-    return sum / float32(len(values))
-}
-
-func max(values []float32) float32 {
-    maxVal := values[0]
-    for _, v := range values {
-        if v > maxVal {
-            maxVal = v
-        }
-    }
-    return maxVal
 }
 
 // computeGAE computes Generalized Advantage Estimation
@@ -1375,6 +1335,11 @@ func (m *Model) Train(batch []Experience) {
     m.mu.Lock()
     defer m.mu.Unlock()
     
+    if len(batch) == 0 {
+        log.Printf("[WARNING] Empty batch received in Train")
+        return
+    }
+    
     if m.device == "cuda" {
         contextMutex.Lock()
         if err := makeContextCurrent(m.cudaContext); err != nil {
@@ -1412,10 +1377,208 @@ func (m *Model) Train(batch []Experience) {
             return
         }
 
-        // Process each experience in the batch
+        // Process experiences in parallel using CUDA streams
+        numStreams := 4 // Number of parallel streams
+        streamSize := (len(batch) + numStreams - 1) / numStreams // Ceiling division
+        
+        for stream := 0; stream < numStreams; stream++ {
+            start := stream * streamSize
+            end := min((stream+1)*streamSize, len(batch))
+            
+            if start >= len(batch) {
+                break
+            }
+            
+            // Process this stream's experiences
+            for i := start; i < end; i++ {
+                exp := batch[i]
+                
+                // Forward pass
+                action, value := m.Forward(exp.Observation)
+                
+                // Log forward pass results
+                log.Printf("[DEBUG] Forward pass - Action: %v, Value: %f", action, value)
+
+                // Calculate advantages and returns
+                advantage := exp.Reward + m.gamma*exp.NextValue - value
+                returns := exp.Reward + m.gamma*exp.NextValue
+                
+                // Log advantage calculation
+                log.Printf("[DEBUG] Advantage calculation - Reward: %f, NextValue: %f, Value: %f, Advantage: %f",
+                    exp.Reward, exp.NextValue, value, advantage)
+
+                // Calculate policy loss with PPO clipping
+                policyLoss := float32(0)
+                entropyBonus := float32(0)
+                
+                // Calculate action probabilities and log probabilities
+                actionProbs := make([]float32, OutputSize)
+                logProbs := make([]float32, OutputSize)
+                
+                // Convert actions to probabilities
+                for i := range action {
+                    if i < 3 { // Movement and rotation actions
+                        actionProbs[i] = (action[i] + 1) / 2 // tanh: [-1,1] -> [0,1]
+                    } else { // Shooting action
+                        actionProbs[i] = action[i] // sigmoid: [0,1]
+                    }
+                    logProbs[i] = float32(math.Log(float64(actionProbs[i])))
+                    entropyBonus -= actionProbs[i] * logProbs[i]
+                }
+                
+                // Log action probabilities
+                log.Printf("[DEBUG] Action probabilities: %v, Log probabilities: %v", actionProbs, logProbs)
+                
+                // Calculate policy gradient with PPO clipping for each action
+                for i := range action {
+                    if i >= len(exp.LogProbs) {
+                        log.Printf("[ERROR] LogProbs array too short: %d < %d", len(exp.LogProbs), i)
+                        continue
+                    }
+                    ratio := float32(math.Exp(float64(logProbs[i] - exp.LogProbs[i])))
+                    clippedRatio := float32(math.Max(float64(1-m.epsilon*2.0), math.Min(float64(1+m.epsilon*2.0), float64(ratio))))
+                    
+                    actionLoss := -float32(math.Min(
+                        float64(ratio*advantage),
+                        float64(clippedRatio*advantage),
+                    ))
+                    policyLoss += actionLoss
+                }
+                
+                // Add entropy bonus to encourage exploration
+                policyLoss -= 0.2 * entropyBonus
+                
+                // Log policy loss components
+                log.Printf("[DEBUG] Policy loss - EntropyBonus: %f, TotalLoss: %f",
+                    entropyBonus, policyLoss)
+
+                // Calculate gradients
+                actorGrads := make([]float32, len(m.actorWeights))
+
+                // Backpropagate through the network
+                // Output layer gradients
+                outputGrads := make([]float32, OutputSize)
+                for i := range action {
+                    if i < 3 { // Movement and rotation actions
+                        outputGrads[i] = -advantage * (1 - action[i]*action[i]) // tanh derivative
+                    } else { // Shooting action
+                        outputGrads[i] = -advantage * action[i] * (1 - action[i]) // sigmoid derivative
+                    }
+                }
+                
+                // Hidden layer 2 gradients
+                hidden2Grads := make([]float32, HiddenSize)
+                for i := 0; i < HiddenSize; i++ {
+                    var grad float32
+                    for j := 0; j < OutputSize; j++ {
+                        grad += outputGrads[j] * m.actorWeights[InputSize*HiddenSize+HiddenSize*HiddenSize+i*OutputSize+j]
+                    }
+                    hidden2Grads[i] = grad * float32(math.Max(0, 1)) // ReLU derivative
+                }
+                
+                // Hidden layer 1 gradients
+                hidden1Grads := make([]float32, HiddenSize)
+                for i := 0; i < HiddenSize; i++ {
+                    var grad float32
+                    for j := 0; j < HiddenSize; j++ {
+                        grad += hidden2Grads[j] * m.actorWeights[InputSize*HiddenSize+i*HiddenSize+j]
+                    }
+                    hidden1Grads[i] = grad * float32(math.Max(0, 1)) // ReLU derivative
+                }
+                
+                // Update actor weights with column-major layout
+                for i := 0; i < HiddenSize; i++ {
+                    for j := 0; j < InputSize; j++ {
+                        actorGrads[j*HiddenSize+i] = hidden1Grads[i] * exp.Observation[j]
+                    }
+                }
+                
+                for i := 0; i < HiddenSize; i++ {
+                    for j := 0; j < HiddenSize; j++ {
+                        actorGrads[InputSize*HiddenSize+i*HiddenSize+j] = hidden2Grads[j] * float32(math.Max(0, float64(hidden1Grads[i])))
+                    }
+                }
+                
+                for i := 0; i < OutputSize; i++ {
+                    for j := 0; j < HiddenSize; j++ {
+                        actorGrads[InputSize*HiddenSize+HiddenSize*HiddenSize+j*OutputSize+i] = outputGrads[i] * float32(math.Max(0, float64(hidden2Grads[j])))
+                    }
+                }
+
+                // Calculate critic gradient
+                criticGrad := value - returns
+
+                // Clip gradients
+                clipGradients(actorGrads, 1.0)
+                if criticGrad > 1.0 {
+                    criticGrad = 1.0
+                } else if criticGrad < -1.0 {
+                    criticGrad = -1.0
+                }
+
+                // Copy gradients to GPU
+                if err := result(C.cuMemcpyHtoD(actorGradients, unsafe.Pointer(&actorGrads[0]), C.size_t(len(actorGrads)*4))); err != nil {
+                    log.Printf("[ERROR] Failed to copy actor gradients to GPU: %v", err)
+                    return
+                }
+                if err := result(C.cuMemcpyHtoD(criticGradients, unsafe.Pointer(&criticGrad), C.size_t(4))); err != nil {
+                    log.Printf("[ERROR] Failed to copy critic gradient to GPU: %v", err)
+                    return
+                }
+
+                // Create variables for kernel arguments
+                learningRate := C.float(m.learningRate)
+                actorSize := C.int(len(m.actorWeights))
+                criticSize := C.int(len(m.criticWeights))
+
+                // Update actor weights using CUDA kernels
+                args := []unsafe.Pointer{
+                    unsafe.Pointer(&m.gpuBuffers.actorWeights),
+                    unsafe.Pointer(&actorGradients),
+                    unsafe.Pointer(&learningRate),
+                    unsafe.Pointer(&actorSize),
+                }
+                if err := result(C.cuLaunchKernel(
+                    m.kernels.train,
+                    C.uint((len(m.actorWeights)+255)/256), 1, 1,
+                    256, 1, 1,
+                    0, m.cudaStreams.compute,
+                    &args[0], nil,
+                )); err != nil {
+                    log.Printf("[ERROR] Failed to launch actor training kernel: %v", err)
+                    return
+                }
+
+                // Update critic weights using CUDA kernels
+                args = []unsafe.Pointer{
+                    unsafe.Pointer(&m.gpuBuffers.criticWeights),
+                    unsafe.Pointer(&criticGradients),
+                    unsafe.Pointer(&learningRate),
+                    unsafe.Pointer(&criticSize),
+                }
+                if err := result(C.cuLaunchKernel(
+                    m.kernels.train,
+                    C.uint((len(m.criticWeights)+255)/256), 1, 1,
+                    256, 1, 1,
+                    0, m.cudaStreams.compute,
+                    &args[0], nil,
+                )); err != nil {
+                    log.Printf("[ERROR] Failed to launch critic training kernel: %v", err)
+                    return
+                }
+            }
+        }
+    } else {
+        // CPU implementation with the same logic
+        log.Printf("[DEBUG] Performing CPU training step with batch size: %d", len(batch))
         for _, exp := range batch {
             // Forward pass
             action, value := m.Forward(exp.Observation)
+            
+            if len(action) == 0 {
+                log.Printf("[ERROR] Forward pass returned empty action array")
+                continue
+            }
             
             // Log forward pass results
             log.Printf("[DEBUG] Forward pass - Action: %v, Value: %f", action, value)
@@ -1433,103 +1596,101 @@ func (m *Model) Train(batch []Experience) {
             entropyBonus := float32(0)
             
             // Calculate action probabilities and log probabilities
-            actionProbs := make([]float32, 3)
-            logProbs := make([]float32, 3)
+            actionProbs := make([]float32, OutputSize)
+            logProbs := make([]float32, OutputSize)
             
+            // Convert actions to probabilities
             for i := range action {
-                if i < 2 { // Movement actions (tanh)
-                    actionProbs[i] = (action[i] + 1) / 2 // Convert [-1,1] to [0,1]
-                    logProbs[i] = float32(math.Log(float64(actionProbs[i])))
-                } else { // Shooting action (sigmoid)
-                    actionProbs[i] = action[i]
-                    logProbs[i] = float32(math.Log(float64(actionProbs[i])))
+                if i < 3 { // Movement and rotation actions
+                    actionProbs[i] = (action[i] + 1) / 2 // tanh: [-1,1] -> [0,1]
+                } else { // Shooting action
+                    actionProbs[i] = action[i] // sigmoid: [0,1]
                 }
-                
-                // Add entropy bonus for exploration
+                logProbs[i] = float32(math.Log(float64(actionProbs[i])))
                 entropyBonus -= actionProbs[i] * logProbs[i]
             }
             
             // Log action probabilities
             log.Printf("[DEBUG] Action probabilities: %v, Log probabilities: %v", actionProbs, logProbs)
             
-            // Calculate policy gradient with PPO clipping
-            ratio := float32(math.Exp(float64(logProbs[0] - exp.LogProb)))
-            clippedRatio := float32(math.Max(float64(1-m.epsilon*2.0), math.Min(float64(1+m.epsilon*2.0), float64(ratio))))  // Doubled clipping range
-            
-            policyLoss = -float32(math.Min(
-                float64(ratio*advantage),
-                float64(clippedRatio*advantage),
-            ))
+            // Calculate policy gradient with PPO clipping for each action
+            for i := range action {
+                if i >= len(exp.LogProbs) {
+                    log.Printf("[ERROR] LogProbs array too short: %d < %d", len(exp.LogProbs), i)
+                    continue
+                }
+                ratio := float32(math.Exp(float64(logProbs[i] - exp.LogProbs[i])))
+                clippedRatio := float32(math.Max(float64(1-m.epsilon*2.0), math.Min(float64(1+m.epsilon*2.0), float64(ratio))))
+                
+                actionLoss := -float32(math.Min(
+                    float64(ratio*advantage),
+                    float64(clippedRatio*advantage),
+                ))
+                policyLoss += actionLoss
+            }
             
             // Add entropy bonus to encourage exploration
-            policyLoss -= 0.2 * entropyBonus  // Increased from 0.05 to 0.2 for maximum entropy
+            policyLoss -= 0.2 * entropyBonus
             
             // Log policy loss components
-            log.Printf("[DEBUG] Policy loss - Ratio: %f, ClippedRatio: %f, EntropyBonus: %f, TotalLoss: %f",
-                ratio, clippedRatio, entropyBonus, policyLoss)
+            log.Printf("[DEBUG] Policy loss - EntropyBonus: %f, TotalLoss: %f",
+                entropyBonus, policyLoss)
 
-            // Calculate actor gradients with proper backpropagation
+            // Calculate gradients
             actorGrads := make([]float32, len(m.actorWeights))
-            
+
             // Backpropagate through the network
             // Output layer gradients
-            outputGrads := make([]float32, 3)
+            outputGrads := make([]float32, OutputSize)
             for i := range action {
-                if i < 2 { // Movement actions
+                if i < 3 { // Movement and rotation actions
                     outputGrads[i] = -advantage * (1 - action[i]*action[i]) // tanh derivative
                 } else { // Shooting action
                     outputGrads[i] = -advantage * action[i] * (1 - action[i]) // sigmoid derivative
                 }
             }
             
-            // Log output gradients
-            log.Printf("[DEBUG] Output gradients: %v", outputGrads)
-            
             // Hidden layer 2 gradients
-            hidden2Grads := make([]float32, 64)
-            for i := 0; i < 64; i++ {
+            hidden2Grads := make([]float32, HiddenSize)
+            for i := 0; i < HiddenSize; i++ {
                 var grad float32
-                for j := 0; j < 3; j++ {
-                    grad += outputGrads[j] * m.actorWeights[6*64+64*64+i*3+j]
+                for j := 0; j < OutputSize; j++ {
+                    grad += outputGrads[j] * m.actorWeights[InputSize*HiddenSize+HiddenSize*HiddenSize+i*OutputSize+j]
                 }
                 hidden2Grads[i] = grad * float32(math.Max(0, 1)) // ReLU derivative
             }
             
             // Hidden layer 1 gradients
-            hidden1Grads := make([]float32, 64)
-            for i := 0; i < 64; i++ {
+            hidden1Grads := make([]float32, HiddenSize)
+            for i := 0; i < HiddenSize; i++ {
                 var grad float32
-                for j := 0; j < 64; j++ {
-                    grad += hidden2Grads[j] * m.actorWeights[6*64+i*64+j]
+                for j := 0; j < HiddenSize; j++ {
+                    grad += hidden2Grads[j] * m.actorWeights[InputSize*HiddenSize+i*HiddenSize+j]
                 }
                 hidden1Grads[i] = grad * float32(math.Max(0, 1)) // ReLU derivative
             }
             
             // Update actor weights with column-major layout
-            for i := 0; i < 64; i++ {
-                for j := 0; j < 6; j++ {
-                    actorGrads[j*64+i] = hidden1Grads[i] * exp.Observation[j]
+            for i := 0; i < HiddenSize; i++ {
+                for j := 0; j < InputSize; j++ {
+                    actorGrads[j*HiddenSize+i] = hidden1Grads[i] * exp.Observation[j]
                 }
             }
             
-            for i := 0; i < 64; i++ {
-                for j := 0; j < 64; j++ {
-                    actorGrads[6*64+i*64+j] = hidden2Grads[j] * float32(math.Max(0, float64(hidden1Grads[i])))
+            for i := 0; i < HiddenSize; i++ {
+                for j := 0; j < HiddenSize; j++ {
+                    actorGrads[InputSize*HiddenSize+i*HiddenSize+j] = hidden2Grads[j] * float32(math.Max(0, float64(hidden1Grads[i])))
                 }
             }
             
-            for i := 0; i < 3; i++ {
-                for j := 0; j < 64; j++ {
-                    actorGrads[6*64+64*64+j*3+i] = outputGrads[i] * float32(math.Max(0, float64(hidden2Grads[j])))
+            for i := 0; i < OutputSize; i++ {
+                for j := 0; j < HiddenSize; j++ {
+                    actorGrads[InputSize*HiddenSize+HiddenSize*HiddenSize+j*OutputSize+i] = outputGrads[i] * float32(math.Max(0, float64(hidden2Grads[j])))
                 }
             }
 
-            // Calculate critic gradients with proper value function loss
-            valueLoss := float32(0.5) * float32(math.Pow(float64(value-returns), 2))
+            // Calculate critic gradient
             criticGrad := value - returns
-            
-            // Log value loss
-            log.Printf("[DEBUG] Value loss: %f", valueLoss)
 
             // Clip gradients
             clipGradients(actorGrads, 1.0)
@@ -1539,194 +1700,12 @@ func (m *Model) Train(batch []Experience) {
                 criticGrad = -1.0
             }
 
-            // Copy gradients to GPU
-            if err := result(C.cuMemcpyHtoD(actorGradients, unsafe.Pointer(&actorGrads[0]), C.size_t(len(actorGrads)*4))); err != nil {
-                log.Printf("[ERROR] Failed to copy actor gradients to GPU: %v", err)
-                return
-            }
-            if err := result(C.cuMemcpyHtoD(criticGradients, unsafe.Pointer(&criticGrad), C.size_t(4))); err != nil {
-                log.Printf("[ERROR] Failed to copy critic gradient to GPU: %v", err)
-                return
-            }
-
-            // Create variables for kernel arguments
-            learningRate := C.float(m.learningRate)
-            actorSize := C.int(len(m.actorWeights))
-            criticSize := C.int(len(m.criticWeights))
-
-            // Update actor weights using CUDA kernels
-            args := []unsafe.Pointer{
-                unsafe.Pointer(&m.gpuBuffers.actorWeights),
-                unsafe.Pointer(&actorGradients),
-                unsafe.Pointer(&learningRate),
-                unsafe.Pointer(&actorSize),
-            }
-            if err := result(C.cuLaunchKernel(
-                m.kernels.train,
-                C.uint((len(m.actorWeights)+255)/256), 1, 1,
-                256, 1, 1,
-                0, m.cudaStreams.compute,
-                &args[0], nil,
-            )); err != nil {
-                log.Printf("[ERROR] Failed to launch actor training kernel: %v", err)
-                return
-            }
-
-            // Update critic weights using CUDA kernels
-            args = []unsafe.Pointer{
-                unsafe.Pointer(&m.gpuBuffers.criticWeights),
-                unsafe.Pointer(&criticGradients),
-                unsafe.Pointer(&learningRate),
-                unsafe.Pointer(&criticSize),
-            }
-            if err := result(C.cuLaunchKernel(
-                m.kernels.train,
-                C.uint((len(m.criticWeights)+255)/256), 1, 1,
-                256, 1, 1,
-                0, m.cudaStreams.compute,
-                &args[0], nil,
-            )); err != nil {
-                log.Printf("[ERROR] Failed to launch critic training kernel: %v", err)
-                return
-            }
-        }
-
-        // Copy updated weights back to CPU
-        if err := result(C.cuMemcpyDtoH(unsafe.Pointer(&m.actorWeights[0]), m.gpuBuffers.actorWeights, C.size_t(len(m.actorWeights)*4))); err != nil {
-            log.Printf("[ERROR] Failed to copy actor weights from GPU: %v", err)
-            return
-        }
-        if err := result(C.cuMemcpyDtoH(unsafe.Pointer(&m.criticWeights[0]), m.gpuBuffers.criticWeights, C.size_t(len(m.criticWeights)*4))); err != nil {
-            log.Printf("[ERROR] Failed to copy critic weights from GPU: %v", err)
-            return
-        }
-    } else {
-        // CPU implementation with the same logic
-        log.Printf("[DEBUG] Performing CPU training step with batch size: %d", len(batch))
-        for _, exp := range batch {
-            // Forward pass
-            action, value := m.Forward(exp.Observation)
-            
-            // Log forward pass results
-            log.Printf("[DEBUG] Forward pass - Action: %v, Value: %f", action, value)
-
-            // Calculate advantages and returns
-            advantage := exp.Reward + m.gamma*exp.NextValue - value
-            returns := exp.Reward + m.gamma*exp.NextValue
-            
-            // Log advantage calculation
-            log.Printf("[DEBUG] Advantage calculation - Reward: %f, NextValue: %f, Value: %f, Advantage: %f",
-                exp.Reward, exp.NextValue, value, advantage)
-
-            // Calculate policy loss with PPO clipping
-            policyLoss := float32(0)
-            entropyBonus := float32(0)
-            
-            // Calculate action probabilities and log probabilities
-            actionProbs := make([]float32, 3)
-            logProbs := make([]float32, 3)
-            
-            for i := range action {
-                if i < 2 { // Movement actions (tanh)
-                    actionProbs[i] = (action[i] + 1) / 2 // Convert [-1,1] to [0,1]
-                    logProbs[i] = float32(math.Log(float64(actionProbs[i])))
-                } else { // Shooting action (sigmoid)
-                    actionProbs[i] = action[i]
-                    logProbs[i] = float32(math.Log(float64(actionProbs[i])))
-                }
-                
-                // Add entropy bonus for exploration
-                entropyBonus -= actionProbs[i] * logProbs[i]
-            }
-            
-            // Log action probabilities
-            log.Printf("[DEBUG] Action probabilities: %v, Log probabilities: %v", actionProbs, logProbs)
-            
-            // Calculate policy gradient with PPO clipping
-            ratio := float32(math.Exp(float64(logProbs[0] - exp.LogProb)))
-            clippedRatio := float32(math.Max(float64(1-m.epsilon*2.0), math.Min(float64(1+m.epsilon*2.0), float64(ratio))))  // Doubled clipping range
-            
-            policyLoss = -float32(math.Min(
-                float64(ratio*advantage),
-                float64(clippedRatio*advantage),
-            ))
-            
-            // Add entropy bonus to encourage exploration
-            policyLoss -= 0.2 * entropyBonus  // Increased from 0.05 to 0.2 for maximum entropy
-            
-            // Log policy loss components
-            log.Printf("[DEBUG] Policy loss - Ratio: %f, ClippedRatio: %f, EntropyBonus: %f, TotalLoss: %f",
-                ratio, clippedRatio, entropyBonus, policyLoss)
-
-            // Calculate gradients
-            actorGrads := make([]float32, len(m.actorWeights))
-            criticGrads := make([]float32, len(m.criticWeights))
-
-            // Backpropagate through the network
-            // Output layer gradients
-            outputGrads := make([]float32, 3)
-            for i := range action {
-                if i < 2 { // Movement actions
-                    outputGrads[i] = -advantage * (1 - action[i]*action[i]) // tanh derivative
-                } else { // Shooting action
-                    outputGrads[i] = -advantage * action[i] * (1 - action[i]) // sigmoid derivative
-                }
-            }
-            
-            // Hidden layer 2 gradients
-            hidden2Grads := make([]float32, 64)
-            for i := 0; i < 64; i++ {
-                var grad float32
-                for j := 0; j < 3; j++ {
-                    grad += outputGrads[j] * m.actorWeights[6*64+64*64+i*3+j]
-                }
-                hidden2Grads[i] = grad * float32(math.Max(0, 1)) // ReLU derivative
-            }
-            
-            // Hidden layer 1 gradients
-            hidden1Grads := make([]float32, 64)
-            for i := 0; i < 64; i++ {
-                var grad float32
-                for j := 0; j < 64; j++ {
-                    grad += hidden2Grads[j] * m.actorWeights[6*64+i*64+j]
-                }
-                hidden1Grads[i] = grad * float32(math.Max(0, 1)) // ReLU derivative
-            }
-            
-            // Update actor weights with column-major layout
-            for i := 0; i < 64; i++ {
-                for j := 0; j < 6; j++ {
-                    actorGrads[j*64+i] = hidden1Grads[i] * exp.Observation[j]
-                }
-            }
-            
-            for i := 0; i < 64; i++ {
-                for j := 0; j < 64; j++ {
-                    actorGrads[6*64+i*64+j] = hidden2Grads[j] * float32(math.Max(0, float64(hidden1Grads[i])))
-                }
-            }
-            
-            for i := 0; i < 3; i++ {
-                for j := 0; j < 64; j++ {
-                    actorGrads[6*64+64*64+j*3+i] = outputGrads[i] * float32(math.Max(0, float64(hidden2Grads[j])))
-                }
-            }
-
-            // Calculate critic gradients
-            for i := range m.criticWeights {
-                criticGrads[i] = value - returns
-            }
-
-            // Clip gradients
-            clipGradients(actorGrads, 1.0)
-            clipGradients(criticGrads, 1.0)
-
             // Update weights with gradient descent
             for i := range m.actorWeights {
                 m.actorWeights[i] -= m.learningRate * actorGrads[i]
             }
             for i := range m.criticWeights {
-                m.criticWeights[i] -= m.learningRate * criticGrads[i]
+                m.criticWeights[i] -= m.learningRate * criticGrad
             }
         }
     }
@@ -1793,15 +1772,22 @@ func (m *Model) Load(path string) error {
 }
 
 // Helper functions
+func min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
 func relu(x float32) float32 {
-	if x > 0 {
-		return x
-	}
-	return 0
+    if x > 0 {
+        return x
+    }
+    return 0
 }
 
 func tanh(x float32) float32 {
-	return float32(math.Tanh(float64(x)))
+    return float32(math.Tanh(float64(x)))
 }
 
 // Helper functions for gradients
@@ -1831,20 +1817,15 @@ type TrainingServer struct {
 	shutdownChan    chan struct{}
 	instanceData    map[string]map[string]interface{}
 	instanceMutex   sync.RWMutex
-	checkpointPath  string
 	logPath         string
-	lastCheckpoint  time.Time
-	checkpointMutex sync.RWMutex
 	logger          *Logger
 }
 
 // NewTrainingServer creates a new training server
 func NewTrainingServer(playerID, port int) *TrainingServer {
 	// Create directories
-	os.MkdirAll(CheckpointDir, 0755)
 	os.MkdirAll(LogDir, 0755)
 	
-	checkpointPath := filepath.Join(CheckpointDir, fmt.Sprintf("player_%d", playerID))
 	logPath := filepath.Join(LogDir, fmt.Sprintf("player_%d.log", playerID))
 	
 	// Initialize random seed
@@ -1880,120 +1861,11 @@ func NewTrainingServer(playerID, port int) *TrainingServer {
 		metadata:       &TrainingMetadata{},
 		shutdownChan:   make(chan struct{}),
 		instanceData:   make(map[string]map[string]interface{}),
-		checkpointPath: checkpointPath,
 		logPath:        logPath,
-		lastCheckpoint: time.Now(),
 		logger:         logger,
 	}
 	
-	// Load latest checkpoint if exists
-	if err := server.loadLatestCheckpoint(); err != nil {
-		log.Printf("No checkpoint found or error loading: %v", err)
-	}
-	
 	return server
-}
-
-// loadLatestCheckpoint loads the most recent checkpoint
-func (s *TrainingServer) loadLatestCheckpoint() error {
-	files, err := filepath.Glob(s.checkpointPath + "_*.json")
-	if err != nil {
-		return err
-	}
-	
-	if len(files) == 0 {
-		return fmt.Errorf("no checkpoints found")
-	}
-	
-	// Find latest checkpoint
-	var latestFile string
-	var latestTime time.Time
-	for _, file := range files {
-		info, err := os.Stat(file)
-		if err != nil {
-			continue
-		}
-		if info.ModTime().After(latestTime) {
-			latestTime = info.ModTime()
-			latestFile = file
-		}
-	}
-	
-	if latestFile == "" {
-		return fmt.Errorf("no valid checkpoints found")
-	}
-	
-	// Load checkpoint
-	data, err := os.ReadFile(latestFile)
-	if err != nil {
-		return err
-	}
-	
-	var checkpoint ModelCheckpoint
-	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		return err
-	}
-	
-	// Restore model state
-	s.metadataMutex.Lock()
-	s.metadata.TotalSteps = checkpoint.TotalSteps
-	s.metadata.TotalEpisodes = checkpoint.TotalEpisodes
-	s.metadata.TotalReward = checkpoint.TotalReward
-	s.metadata.LossHistory = checkpoint.LossHistory
-	s.metadataMutex.Unlock()
-	
-	s.model.LoadWeights(checkpoint.Weights.Actor, checkpoint.Weights.Critic)
-	
-	log.Printf("Loaded checkpoint from %s", latestFile)
-	return nil
-}
-
-// saveCheckpoint saves the current model state
-func (s *TrainingServer) saveCheckpoint() error {
-    s.checkpointMutex.Lock()
-    defer s.checkpointMutex.Unlock()
-    
-    // Check if enough time has passed since last checkpoint
-    if time.Since(s.lastCheckpoint) < 5*time.Minute {
-        return nil
-    }
-    
-    timestamp := time.Now().Format("20060102_150405")
-    
-    // Save model weights
-    modelPath := filepath.Join(CheckpointDir, fmt.Sprintf("model_%s.pt", timestamp))
-    if err := s.model.Save(modelPath); err != nil {
-        return fmt.Errorf("failed to save model: %v", err)
-    }
-    
-    // Save metadata separately
-    metadataPath := filepath.Join(CheckpointDir, fmt.Sprintf("metadata_%s.json", timestamp))
-    metadata := struct {
-        Timestamp     string    `json:"timestamp"`
-        TotalSteps    int64     `json:"total_steps"`
-        TotalEpisodes int64     `json:"total_episodes"`
-        TotalReward   float32   `json:"total_reward"`
-        LossHistory   []float32 `json:"loss_history"`
-    }{
-        Timestamp:     timestamp,
-        TotalSteps:    s.metadata.TotalSteps,
-        TotalEpisodes: s.metadata.TotalEpisodes,
-        TotalReward:   s.metadata.TotalReward,
-        LossHistory:   s.metadata.LossHistory,
-    }
-    
-    data, err := json.MarshalIndent(metadata, "", "  ")
-    if err != nil {
-        return fmt.Errorf("failed to marshal metadata: %v", err)
-    }
-    
-    if err := os.WriteFile(metadataPath, data, 0644); err != nil {
-        return fmt.Errorf("failed to write metadata: %v", err)
-    }
-    
-    s.lastCheckpoint = time.Now()
-    log.Printf("Saved model to %s and metadata to %s", modelPath, metadataPath)
-    return nil
 }
 
 // monitorResources periodically checks system resources
@@ -2008,11 +1880,6 @@ func (s *TrainingServer) monitorResources() {
 		case <-ticker.C:
 			if err := s.logResourceUsage(); err != nil {
 				log.Printf("Error monitoring resources: %v", err)
-			}
-			
-			// Save checkpoint periodically
-			if err := s.saveCheckpoint(); err != nil {
-				log.Printf("Error saving checkpoint: %v", err)
 			}
 		}
 	}
@@ -2172,9 +2039,22 @@ func (s *TrainingServer) handleGetAction(c *gin.Context) {
         requestID, req.PlayerID, req.InstanceID, req.Observation))
     
     // Forward pass
-    action, value := s.model.Forward(req.Observation)
+    rawActions, value := s.model.Forward(req.Observation)
     
-    s.logger.Log("info", fmt.Sprintf("[mario] [%s] Action response - Player: %d, Action: %v, Value: %f, Time: %v", 
+    // Convert raw actions to structured format
+    action := struct {
+        MoveX   float32 `json:"move_x"`
+        MoveZ   float32 `json:"move_z"`
+        Rotate  float32 `json:"rotate"`
+        Shoot   bool    `json:"shoot"`
+    }{
+        MoveX:   rawActions[0],
+        MoveZ:   rawActions[1],
+        Rotate:  rawActions[2],
+        Shoot:   rawActions[3] > 0.5, // Convert to bool using threshold
+    }
+    
+    s.logger.Log("info", fmt.Sprintf("[mario] [%s] Action response - Player: %d, Action: %+v, Value: %f, Time: %v", 
         requestID, req.PlayerID, action, value, time.Since(startTime)))
     
     response := gin.H{
@@ -2194,7 +2074,13 @@ func (s *TrainingServer) handleUpdateReward(c *gin.Context) {
         Reward     float32 `json:"reward"`
         Done       bool    `json:"done"`
         PlayerID   int     `json:"player_id"`
-        NextState  []float32 `json:"next_state"`  // Add next_state to request
+        NextState  []float32 `json:"next_state"`
+        Action     struct {
+            MoveX   float32 `json:"move_x"`
+            MoveZ   float32 `json:"move_z"`
+            Rotate  float32 `json:"rotate"`
+            Shoot   bool    `json:"shoot"`
+        } `json:"action"`
     }
     
     if err := c.BindJSON(&req); err != nil {
@@ -2213,11 +2099,37 @@ func (s *TrainingServer) handleUpdateReward(c *gin.Context) {
         s.instanceMutex.RUnlock()
     }
     
+    // Calculate log probabilities for each action
+    logProbs := make([]float32, OutputSize)
+    for i, a := range []float32{req.Action.MoveX, req.Action.MoveZ, req.Action.Rotate, float32(btoi(req.Action.Shoot))} {
+        if i < 3 { // Movement and rotation actions (tanh)
+            // Convert from [-1,1] to [0,1] for log probability
+            p := (a + 1) / 2
+            logProbs[i] = float32(math.Log(float64(p)))
+        } else { // Shooting action (sigmoid)
+            // Already in [0,1] range
+            logProbs[i] = float32(math.Log(float64(a)))
+        }
+    }
+    
     // Add experience to buffer with next state
     exp := Experience{
-        Reward: req.Reward,
-        Done:   req.Done,
-        NextValue: 0,  // Will be updated when next state is processed
+        Observation: req.NextState,
+        Action: struct {
+            MoveX   float32 `json:"move_x"`
+            MoveZ   float32 `json:"move_z"`
+            Rotate  float32 `json:"rotate"`
+            Shoot   bool    `json:"shoot"`
+        }{
+            MoveX:   req.Action.MoveX,
+            MoveZ:   req.Action.MoveZ,
+            Rotate:  req.Action.Rotate,
+            Shoot:   req.Action.Shoot,
+        },
+        Reward:     req.Reward,
+        Done:       req.Done,
+        NextValue:  0,  // Will be updated when next state is processed
+        LogProbs:   logProbs, // Store all log probabilities
     }
     
     // Store next state for value prediction
@@ -2252,29 +2164,54 @@ func (s *TrainingServer) handleUpdateReward(c *gin.Context) {
 func (s *TrainingServer) handleTrain(c *gin.Context) {
     s.logger.Log("info", "Processing train request")
     
-    s.bufferMutex.RLock()
-    batch, _ := s.buffer.GetBatch(BatchSize)
-    s.bufferMutex.RUnlock()
+    var request struct {
+        Experiences []Experience `json:"experiences"`
+    }
     
-    if batch == nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Insufficient buffer size"})
+    // Log raw request body for debugging
+    body, err := c.GetRawData()
+    if err != nil {
+        s.logger.Log("error", fmt.Sprintf("Failed to read request body: %v", err))
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
+        return
+    }
+    s.logger.Log("debug", fmt.Sprintf("Raw request body: %s", string(body)))
+    
+    // Reset request body for binding
+    c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+    
+    if err := c.BindJSON(&request); err != nil {
+        s.logger.Log("error", fmt.Sprintf("JSON binding failed: %v", err))
+        c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid request format: %v", err)})
         return
     }
     
-    s.model.Train(batch)
+    if len(request.Experiences) == 0 {
+        s.logger.Log("error", "No experiences provided in request")
+        c.JSON(http.StatusBadRequest, gin.H{"error": "No experiences provided"})
+        return
+    }
+    
+    s.logger.Log("info", fmt.Sprintf("Training on %d experiences", len(request.Experiences)))
+    
+    // Log first experience for debugging
+    if len(request.Experiences) > 0 {
+        s.logger.Log("debug", fmt.Sprintf("First experience: %+v", request.Experiences[0]))
+    }
+    
+    s.model.Train(request.Experiences)
     
     s.metadataMutex.Lock()
-    s.metadata.TotalSteps += int64(len(batch))
+    s.metadata.TotalSteps += int64(len(request.Experiences))
     s.metadataMutex.Unlock()
     
     c.JSON(http.StatusOK, gin.H{
         "status":         "success",
-        "buffer_size":    s.buffer.Size(),
         "total_steps":    s.metadata.TotalSteps,
         "total_episodes": s.metadata.TotalEpisodes,
     })
     
-    s.logger.Log("info", fmt.Sprintf("Training completed: buffer_size=%d", s.buffer.Size()))
+    s.logger.Log("info", fmt.Sprintf("Training completed: processed %d experiences", len(request.Experiences)))
 }
 
 // handleShutdown handles shutdown requests
@@ -2474,7 +2411,6 @@ func main() {
 	runtime.GOMAXPROCS(NumWorkers)
 	
 	// Create required directories
-	os.MkdirAll(CheckpointDir, 0755)
 	os.MkdirAll(LogDir, 0755)
 	
 	// Initialize random seed

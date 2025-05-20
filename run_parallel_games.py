@@ -14,7 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Define gflags
 FLAGS = gflags.FLAGS
-gflags.DEFINE_string('server_url', 'http://localhost:5001', 'URL of the training server')
+# http://localhost:5001 for testing locally
+gflags.DEFINE_string('server_url', 'http://localhost:5000', 'URL of the training server (can be local or remote)')
 gflags.DEFINE_integer('instances', 1, 'Number of parallel game instances to run')
 gflags.DEFINE_integer('cycles', 1, 'Number of cycles to run for each instance')
 
@@ -33,10 +34,17 @@ import subprocess
 import logging
 
 
+# python run_parallel_games.py --server_url=http://localhost:5000 --instances=1 --cycles=1
+
 def start_server():
-    """Start the CPU training server"""
-    logging.info("Starting CPU training server...")
-    server_process = subprocess.Popen(["go", "run", "cpu_training_server.go"])
+    """Start the GPU training server"""
+    logging.info("Building Go files...")
+    build_process = subprocess.run(["go", "build", "gpu_training_server.go", "base_model.go"], check=True)
+    if build_process.returncode != 0:
+        raise RuntimeError("Failed to build Go files")
+    
+    logging.info("Starting GPU training server...")
+    server_process = subprocess.Popen(["./base_model"])
     return server_process
 
 def save_model(cycle_num):
@@ -61,7 +69,8 @@ def save_model(cycle_num):
 def run_game_instance(instance_id, cycle, is_first_in_cycle=False):
     """Run a single game instance for one cycle"""
     logging.info(f"Instance {instance_id} starting cycle {cycle + 1} ({'first' if is_first_in_cycle else 'random'} in cycle)")
-    subprocess.run(["python", "game.py", "--use_ai", "--server_url=http://localhost:5001", f"--headless={not is_first_in_cycle}", f"--is_first_in_cycle={is_first_in_cycle}"])
+    # subprocess.run(["python", "game.py", "--use_ai", "--server_url=http://localhost:5001", f"--headless={not is_first_in_cycle}", f"--is_first_in_cycle={is_first_in_cycle}"])
+    subprocess.run(["python", "game.py", "--use_ai", f"--server_url={FLAGS.server_url}", f"--headless=True"])
     logging.info(f"Instance {instance_id} completed cycle {cycle + 1}")
 
 def train_from_files():

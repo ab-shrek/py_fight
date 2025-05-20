@@ -53,3 +53,5 @@ parallel_games.log
 *.swp
 *.swo
 .DS_Store 
+go.mod
+go.sum
